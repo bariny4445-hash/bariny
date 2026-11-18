@@ -94,6 +94,10 @@
           <p class="text-xs text-slate-400 mt-1.5">API 키는 외부 서버를 거치지 않고 브라우저에서 AI API로 직접 전송됩니다. 키 없이도 '데모 분석'으로 동작을 테스트할 수 있습니다.</p>
         </div>
         <div>
+          <label class="block text-slate-300 font-medium mb-1.5" for="groqKeyInput">백업 Groq API Key (Gemini 서버 오류·한도 초과 시 자동 전환)</label>
+          <input id="groqKeyInput" type="password" placeholder="gsk_... (qwen/qwen3.8-27b 자동 백업)" class="w-full bg-slate-800 border border-slate-700 rounded-xl px-3 py-2.5 text-white focus:outline-none focus:ring-2 focus:ring-orange-500" />
+        </div>
+        <div>
           <label class="block text-slate-300 font-medium mb-1.5" for="customPromptInput">추가 분석 지침 (선택)</label>
           <textarea id="customPromptInput" rows="2" placeholder="예: 정답 번호만 맨 위에 크게 표시하고, 핵심 공식 위주로 3줄 이내로 설명해줘." class="w-full bg-slate-800 border border-slate-700 rounded-xl px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"></textarea>
         </div>
@@ -380,6 +384,7 @@
           provider: 'gemini',
           model: 'gemini-3.5-flash-lite',
           apiKey: 'AQ.Ab8RN6L2UrheWnq7SQUOrgolHTEzoLIWOtwCDZQxmrgBwvT8gw',
+          groqApiKey: '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',
           customPrompt: ''
         },
         filters: {
@@ -447,6 +452,7 @@
         providerSelect: document.getElementById('providerSelect'),
         modelInput: document.getElementById('modelInput'),
         apiKeyInput: document.getElementById('apiKeyInput'),
+        groqKeyInput: document.getElementById('groqKeyInput'),
         toggleKeyVisBtn: document.getElementById('toggleKeyVisBtn'),
         customPromptInput: document.getElementById('customPromptInput'),
         apiTestResult: document.getElementById('apiTestResult'),
@@ -487,7 +493,8 @@
             state.settings = {
               ...state.settings,
               ...parsed,
-              apiKey: parsed.apiKey || state.settings.apiKey
+              apiKey: parsed.apiKey || state.settings.apiKey,
+              groqApiKey: parsed.groqApiKey || state.settings.groqApiKey
             };
             // Lock model to gemini-3.5-flash-lite
             state.settings.provider = 'gemini';
@@ -500,6 +507,7 @@
         el.providerSelect.value = state.settings.provider;
         el.modelInput.value = state.settings.model;
         el.apiKeyInput.value = state.settings.apiKey;
+        el.groqKeyInput.value = state.settings.groqApiKey;
         el.customPromptInput.value = state.settings.customPrompt;
         updateApiModeBadge();
       }
@@ -509,6 +517,7 @@
         state.settings.provider = 'gemini';
         state.settings.model = 'gemini-3.5-flash-lite';
         state.settings.apiKey = el.apiKeyInput.value.trim();
+        state.settings.groqApiKey = el.groqKeyInput.value.trim();
         state.settings.customPrompt = el.customPromptInput.value.trim();
         try {
           localStorage.setItem('visionsolve_settings_v1', JSON.stringify(state.settings));
@@ -523,7 +532,8 @@
 
       function updateApiModeBadge() {
         if (state.settings.apiKey) {
-          el.apiModeBadge.textContent = `${state.settings.provider.toUpperCase()} 연결됨 (${state.settings.model})`;
+          const backupTag = state.settings.groqApiKey ? ' + GROQ 백업' : '';
+          el.apiModeBadge.textContent = `GEMINI 연결됨 (${state.settings.model})${backupTag}`;
           el.apiModeBadge.className = 'text-xs px-2.5 py-1.5 rounded-lg bg-emerald-500/10 text-emerald-300 border border-emerald-500/30 font-medium';
         } else {
           el.apiModeBadge.textContent = '데모 모드 (키 미설정)';
@@ -1109,37 +1119,82 @@
             await new Promise(r => setTimeout(r, 450));
             answerText = `14번: ③`;
           } else if (state.settings.provider === 'gemini') {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 45000);
-            try {
-              setStatus('busy', `${state.settings.model} 요청 중...`);
-              const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(state.settings.model)}:generateContent?key=${encodeURIComponent(state.settings.apiKey)}`;
-              const res = await fetch(url, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                signal: controller.signal,
-                body: JSON.stringify({
-                  contents: [{
-                    parts: geminiParts
-                  }],
-                  generationConfig: {
-                    temperature: 0.1,
-                    maxOutputTokens: 256
-                  }
-                })
-              });
-              const rawText = await res.text();
-              let json = {};
-              try { json = JSON.parse(rawText); } catch (e) {}
-              if (!res.ok) throw new Error(json.error?.message || `HTTP ${res.status}: ${rawText.slice(0, 180)}`);
-              answerText = json.candidates?.[0]?.content?.parts?.map(p => p.text).join('\n') || '응답 텍스트를 받지 못했습니다.';
-            } catch (fetchErr) {
-              if (fetchErr.name === 'AbortError') {
-                throw new Error('요청 시간 초과(45초): 네트워크 또는 API 응답이 지연되고 있습니다.');
+            const callGemini = async () => {
+              const controller = new AbortController();
+              const timeoutId = setTimeout(() => controller.abort(), 25000);
+              try {
+                setStatus('busy', `${state.settings.model} 요청 중...`);
+                const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(state.settings.model)}:generateContent?key=${encodeURIComponent(state.settings.apiKey)}`;
+                const res = await fetch(url, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  signal: controller.signal,
+                  body: JSON.stringify({
+                    contents: [{ parts: geminiParts }],
+                    generationConfig: { temperature: 0.1, maxOutputTokens: 256 }
+                  })
+                });
+                const rawText = await res.text();
+                let json = {};
+                try { json = JSON.parse(rawText); } catch (e) {}
+                if (!res.ok) throw new Error(json.error?.message || `HTTP ${res.status}`);
+                const txt = json.candidates?.[0]?.content?.parts?.map(p => p.text).join('\n') || '';
+                // HTTP 200 OK stays on Gemini even if unreadable/empty
+                return txt.trim() || '재촬영 필요';
+              } finally {
+                clearTimeout(timeoutId);
               }
-              throw fetchErr;
-            } finally {
-              clearTimeout(timeoutId);
+            };
+
+            const callGroqBackup = async () => {
+              const controller = new AbortController();
+              const timeoutId = setTimeout(() => controller.abort(), 30000);
+              try {
+                setStatus('busy', 'Groq (qwen3.8-27b) 백업 요청 중...');
+                const imgContents = [];
+                shotsToSend.forEach((sh) => {
+                  imgContents.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${sh.filteredB64}` } });
+                  if (useDual && sh.rawB64 && imgContents.length < 3) {
+                    imgContents.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${sh.rawB64}` } });
+                  }
+                });
+                const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${state.settings.groqApiKey}`
+                  },
+                  signal: controller.signal,
+                  body: JSON.stringify({
+                    model: 'qwen/qwen3.8-27b',
+                    messages: [{
+                      role: 'user',
+                      content: [{ type: 'text', text: promptText }, ...imgContents.slice(0, 3)]
+                    }],
+                    temperature: 0.1,
+                    max_tokens: 512,
+                    reasoning_effort: 'low'
+                  })
+                });
+                const rawText = await res.text();
+                let json = {};
+                try { json = JSON.parse(rawText); } catch (e) {}
+                if (!res.ok) throw new Error(json.error?.message || `Groq HTTP ${res.status}`);
+                return json.choices?.[0]?.message?.content || '재촬영 필요';
+              } finally {
+                clearTimeout(timeoutId);
+              }
+            };
+
+            try {
+              answerText = await callGemini();
+            } catch (geminiErr) {
+              if (state.settings.groqApiKey) {
+                showToast('Gemini 서버/연결 오류 — Groq 백업으로 자동 전환합니다.', 'info');
+                answerText = await callGroqBackup();
+              } else {
+                throw geminiErr;
+              }
             }
           } else {
             const controller = new AbortController();
