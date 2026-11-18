@@ -94,8 +94,8 @@
           <p class="text-xs text-slate-400 mt-1.5">API 키는 외부 서버를 거치지 않고 브라우저에서 AI API로 직접 전송됩니다. 키 없이도 '데모 분석'으로 동작을 테스트할 수 있습니다.</p>
         </div>
         <div>
-          <label class="block text-slate-300 font-medium mb-1.5" for="groqKeyInput">백업 Groq API Key (Gemini 서버 오류·한도 초과 시 자동 전환)</label>
-          <input id="groqKeyInput" type="password" placeholder="gsk_... (qwen/qwen3.8-27b 자동 백업)" class="w-full bg-slate-800 border border-slate-700 rounded-xl px-3 py-2.5 text-white focus:outline-none focus:ring-2 focus:ring-orange-500" />
+          <label class="block text-slate-300 font-medium mb-1.5" for="backupGeminiKeyInput">백업 Gemini API Key (다른 계정 · 한도/오류 시 자동 전환)</label>
+          <input id="backupGeminiKeyInput" type="password" placeholder="AQ.... (다른 구글 계정의 Gemini API 키)" class="w-full bg-slate-800 border border-slate-700 rounded-xl px-3 py-2.5 text-white focus:outline-none focus:ring-2 focus:ring-indigo-500" />
         </div>
         <div>
           <label class="block text-slate-300 font-medium mb-1.5" for="customPromptInput">추가 분석 지침 (선택)</label>
@@ -377,6 +377,7 @@
         wakeLock: null,
         shotQueue: [], // Array of { filteredB64, rawB64 }
         autoCarryShot: null, // Holds previous partial frame if AI returned '재촬영 필요'
+        lastSuccessShot: null, // Holds last solved frame (90s) for multi-question reading passages like [23~25]
         history: [],
         currentResultText: '',
         demoAnimTick: 0,
@@ -384,7 +385,7 @@
           provider: 'gemini',
           model: 'gemini-3.5-flash-lite',
           apiKey: 'AQ.Ab8RN6L2UrheWnq7SQUOrgolHTEzoLIWOtwCDZQxmrgBwvT8gw',
-          groqApiKey: '',
+          backupGeminiKey: '',
           customPrompt: ''
         },
         filters: {
@@ -452,7 +453,7 @@
         providerSelect: document.getElementById('providerSelect'),
         modelInput: document.getElementById('modelInput'),
         apiKeyInput: document.getElementById('apiKeyInput'),
-        groqKeyInput: document.getElementById('groqKeyInput'),
+        backupGeminiKeyInput: document.getElementById('backupGeminiKeyInput'),
         toggleKeyVisBtn: document.getElementById('toggleKeyVisBtn'),
         customPromptInput: document.getElementById('customPromptInput'),
         apiTestResult: document.getElementById('apiTestResult'),
@@ -494,7 +495,7 @@
               ...state.settings,
               ...parsed,
               apiKey: parsed.apiKey || state.settings.apiKey,
-              groqApiKey: parsed.groqApiKey || state.settings.groqApiKey
+              backupGeminiKey: parsed.backupGeminiKey || state.settings.backupGeminiKey
             };
             // Lock model to gemini-3.5-flash-lite
             state.settings.provider = 'gemini';
@@ -507,7 +508,7 @@
         el.providerSelect.value = state.settings.provider;
         el.modelInput.value = state.settings.model;
         el.apiKeyInput.value = state.settings.apiKey;
-        el.groqKeyInput.value = state.settings.groqApiKey;
+        el.backupGeminiKeyInput.value = state.settings.backupGeminiKey;
         el.customPromptInput.value = state.settings.customPrompt;
         updateApiModeBadge();
       }
@@ -517,7 +518,7 @@
         state.settings.provider = 'gemini';
         state.settings.model = 'gemini-3.5-flash-lite';
         state.settings.apiKey = el.apiKeyInput.value.trim();
-        state.settings.groqApiKey = el.groqKeyInput.value.trim();
+        state.settings.backupGeminiKey = el.backupGeminiKeyInput.value.trim();
         state.settings.customPrompt = el.customPromptInput.value.trim();
         try {
           localStorage.setItem('visionsolve_settings_v1', JSON.stringify(state.settings));
@@ -532,7 +533,7 @@
 
       function updateApiModeBadge() {
         if (state.settings.apiKey) {
-          const backupTag = state.settings.groqApiKey ? ' + GROQ 백업' : '';
+          const backupTag = state.settings.backupGeminiKey ? ' + 백업 키' : '';
           el.apiModeBadge.textContent = `GEMINI 연결됨 (${state.settings.model})${backupTag}`;
           el.apiModeBadge.className = 'text-xs px-2.5 py-1.5 rounded-lg bg-emerald-500/10 text-emerald-300 border border-emerald-500/30 font-medium';
         } else {
@@ -635,8 +636,8 @@
           const deviceId = el.cameraSelect.value;
           const constraints = {
             video: deviceId
-              ? { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
-              : { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'environment' },
+              ? { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 }, focusMode: { ideal: 'continuous' } }
+              : { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'environment', focusMode: { ideal: 'continuous' } },
             audio: false
           };
           const stream = await navigator.mediaDevices.getUserMedia(constraints);
@@ -721,15 +722,127 @@
         const pixelCount = w * h;
 
         const grayBuf = new Uint8ClampedArray(pixelCount);
+
+        // 1. Luminance grayscale + center vs edge brightness measurement for adaptive anti-vignetting
+        let centerSum = 0, centerCnt = 0;
+        let edgeSum = 0, edgeCnt = 0;
+        const x1 = Math.floor(w * 0.30), x2 = Math.ceil(w * 0.70);
+        const y1 = Math.floor(h * 0.30), y2 = Math.ceil(h * 0.70);
+
+        for (let y = 0, p = 0, i = 0; y < h; y++) {
+          const inY = y >= y1 && y <= y2;
+          const borderY = y < h * 0.14 || y > h * 0.86;
+          for (let x = 0; x < w; x++, p++, i += 4) {
+            const lum = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+            grayBuf[p] = lum;
+            if (inY && x >= x1 && x <= x2) {
+              centerSum += lum;
+              centerCnt++;
+            } else if (borderY || x < w * 0.14 || x > w * 0.86) {
+              edgeSum += lum;
+              edgeCnt++;
+            }
+          }
+        }
+
+        // 1b. Adaptive radial anti-vignetting (compensates cos^4 falloff on pinhole/wide miniature lenses)
+        const centerAvg = centerCnt ? centerSum / centerCnt : 128;
+        const edgeAvg = edgeCnt ? edgeSum / edgeCnt : centerAvg;
+        const vigRatio = edgeAvg > 12 ? centerAvg / edgeAvg : 1.0;
+        // Only boost edges when edges are noticeably darker than center; cap gain to avoid noise blowup
+        const radialStrength = Math.max(0.0, Math.min(0.42, (vigRatio - 1.04) * 0.75));
+        if (radialStrength > 0.02) {
+          const cx = w * 0.5;
+          const cy = h * 0.5;
+          const invCx = 1 / Math.max(1, cx);
+          const invCy = 1 / Math.max(1, cy);
+          for (let y = 0, p = 0; y < h; y++) {
+            const dy = (y - cy) * invCy;
+            const dy2 = dy * dy;
+            for (let x = 0; x < w; x++, p++) {
+              const dx = (x - cx) * invCx;
+              const r2 = dx * dx + dy2; // 0 at center, ~2 at corners
+              const gain = 1 + radialStrength * (r2 * 0.5);
+              const boosted = grayBuf[p] * gain;
+              grayBuf[p] = boosted > 255 ? 255 : boosted;
+            }
+          }
+        }
+
+        // 1c. Local background illumination normalization (16x12 coarse grid)
+        // Estimates local paper brightness per block so vignetted/shadowed corners normalize cleanly
+        const gw = 16, gh = 12;
+        const gridCnt = gw * gh;
+        const gridMax = new Float32Array(gridCnt);
+        const gridAvg = new Float32Array(gridCnt);
+        const gridN = new Uint32Array(gridCnt);
+        const step = 2;
+        for (let y = 0; y < h; y += step) {
+          const gy = Math.min(gh - 1, Math.floor((y * gh) / h));
+          const rowOff = y * w;
+          const gRow = gy * gw;
+          for (let x = 0; x < w; x += step) {
+            const gx = Math.min(gw - 1, Math.floor((x * gw) / w));
+            const gi = gRow + gx;
+            const v = grayBuf[rowOff + x];
+            if (v > gridMax[gi]) gridMax[gi] = v;
+            gridAvg[gi] += v;
+            gridN[gi]++;
+          }
+        }
+        const rawBg = new Float32Array(gridCnt);
+        for (let gi = 0; gi < gridCnt; gi++) {
+          const avg = gridN[gi] ? gridAvg[gi] / gridN[gi] : 180;
+          // Blend block max & avg to approximate local paper background without text ink bias
+          rawBg[gi] = Math.max(48, gridMax[gi] * 0.65 + avg * 0.35);
+        }
+        // 3x3 smooth the coarse background map to eliminate block seams
+        const bgMap = new Float32Array(gridCnt);
+        for (let gy = 0; gy < gh; gy++) {
+          for (let gx = 0; gx < gw; gx++) {
+            let sum = 0, cnt = 0;
+            for (let oy = -1; oy <= 1; oy++) {
+              const ny = gy + oy;
+              if (ny < 0 || ny >= gh) continue;
+              for (let ox = -1; ox <= 1; ox++) {
+                const nx = gx + ox;
+                if (nx < 0 || nx >= gw) continue;
+                sum += rawBg[ny * gw + nx];
+                cnt++;
+              }
+            }
+            bgMap[gy * gw + gx] = sum / cnt;
+          }
+        }
+
         const hist = new Uint32Array(256);
         let sumLum = 0;
+        const scaleX = gw / w;
+        const scaleY = gh / h;
+        for (let y = 0, p = 0; y < h; y++) {
+          const fy = Math.max(0, Math.min(gh - 1.001, (y + 0.5) * scaleY - 0.5));
+          const gy0 = Math.floor(fy);
+          const gy1 = Math.min(gh - 1, gy0 + 1);
+          const wy = fy - gy0;
+          const row0 = gy0 * gw;
+          const row1 = gy1 * gw;
+          for (let x = 0; x < w; x++, p++) {
+            const fx = Math.max(0, Math.min(gw - 1.001, (x + 0.5) * scaleX - 0.5));
+            const gx0 = Math.floor(fx);
+            const gx1 = Math.min(gw - 1, gx0 + 1);
+            const wx = fx - gx0;
+            const bg0 = bgMap[row0 + gx0] * (1 - wx) + bgMap[row0 + gx1] * wx;
+            const bg1 = bgMap[row1 + gx0] * (1 - wx) + bgMap[row1 + gx1] * wx;
+            const localBg = bg0 * (1 - wy) + bg1 * wy;
 
-        // 1. Luminance grayscale + histogram build
-        for (let i = 0, p = 0; p < pixelCount; i += 4, p++) {
-          const lum = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
-          grayBuf[p] = lum;
-          hist[lum]++;
-          sumLum += lum;
+            const orig = grayBuf[p];
+            const norm = Math.min(255, (orig / localBg) * 215);
+            // Blend 60% local-normalized + 40% radial-corrected to preserve ink depth
+            const blended = Math.round(norm * 0.60 + orig * 0.40);
+            grayBuf[p] = blended;
+            hist[blended]++;
+            sumLum += blended;
+          }
         }
 
         // 2. Robust 2%~98% percentile bounds (ignores hot-pixel / glare outliers)
@@ -1057,7 +1170,8 @@
         };
         const base = modeMap[el.problemModeSelect.value] || modeMap.eng_all;
         const custom = state.settings.customPrompt ? `\n추가 지침: ${state.settings.customPrompt}` : '';
-        return `${base}\n\n[저화질·분할 촬영 보정 지침]\n- 초소형 카메라 특성상 글씨가 흐릿하거나, 90°/180° 회전·좌우반전되거나, 일부 잘릴 수 있습니다. 방향을 스스로 바로잡아 읽고 앞뒤 문맥·연어·문법 단서로 흐린 단어를 복원해 판단하세요.\n- 보정 이미지와 원본 이미지가 함께 제공되면, 보정 이미지로 글씨를 읽고 원본 이미지로 밑줄(①~⑤)·음영·기호를 교차 확인하세요.\n- 분할 촬영된 여러 장의 이미지가 오면 하나의 연속된 문제로 합쳐서 답을 도출하세요.\n- 핵심 지문과 보기가 결정적으로 잘려 판단 자체가 불가능할 때만 "문항번호: 재촬영 필요"로 출력하세요.\n\n규칙: 반드시 "문항번호: 정답번호" 형식만 출력하세요. 문제 본문, 해석, 설명, 인사말은 절대 쓰지 마세요.\n출력 예시:\n14번: ③${custom}`;
+        return `${base}\n\n[저화질·분할 촬영 보정 지침]\n- 초소형 카메라 특성상 글씨가 흐릿하거나, 90°/180° 회전·좌우반전되거나, 일부 잘릴 수 있습니다. 방향을 스스로 바로잡아 읽고 앞뒤 문맥·연어·문법 단서로 흐린 단어를 복원해 판단하세요.\n- 보정 이미지와 원본 이미지가 함께 제공되면, 보정 이미지로 글씨를 읽고 원본 이미지로 밑줄(①~⑤)·음영·기호를 교차 확인하세요.
+- 초소형 광각 렌즈 특성상 화면 가장자리가 어둡거나(비네팅) 글자·줄이 바깥쪽으로 둥글게 휘어지는 배럴 왜곡이 생길 수 있습니다. 가장자리에 치우쳐 휘어진 문장, 문항 번호, 선택지(①~⑤) 기호도 곡률을 감안해 끝까지 판독하세요.\n- 이미지가 여러 장 전달될 수 있습니다. 가장 마지막(또는 첫 번째 이후)에 현재 화면과 직전 화면이 함께 올 수 있으며, 현재 화면에 지문 없이 24·25번처럼 앞장의 공통 지문([23~25] 등)에 연결된 문제만 보일 때는 직전 화면의 지문을 참고해 현재 화면에 보이는 문항만 푸세요. 이미 직전 화면에서 푼 문항은 중복 출력하지 마세요.\n- 사진이 가로로 눕혀져 있거나 180° 뒤집혀 있어도 스스로 회전해 읽으세요.\n- 문항번호가 화면에 안 보이고 문제와 보기만 있을 때는 "번호없음: 정답번호" 형식으로 출력하세요.\n- 핵심 지문과 보기가 결정적으로 잘려 판단 자체가 불가능할 때만 "문항번호: 재촬영 필요"로 출력하세요.\n\n규칙: 반드시 "문항번호: 정답번호" 형식만 출력하세요. 마크다운(**), 문제 본문, 해석, 설명, 인사말은 절대 쓰지 마세요.\n출력 예시:\n14번: ③${custom}`;
       }
 
       // ===== Call AI Vision API =====
@@ -1068,7 +1182,7 @@
         }
         if (state.isAnalyzing) return;
 
-        const snapCanvas = await captureBestSharpFrame(3);
+        const snapCanvas = await captureBestSharpFrame(5);
         if (!snapCanvas) return;
 
         if (isAuto && state.sourceType !== 'demo') {
@@ -1094,11 +1208,19 @@
           rawB64: snapCanvas._rawCanvas ? snapCanvas._rawCanvas.toDataURL('image/jpeg', 0.88).split(',')[1] : null
         };
         let shotsToSend = [currentShot];
-        if (isAuto && state.autoCarryShot && (Date.now() - state.autoCarryShot.ts < 30000)) {
+        let contextPassageShot = null;
+        if (isAuto && state.autoCarryShot && (Date.now() - state.autoCarryShot.ts < 60000)) {
           shotsToSend = [state.autoCarryShot.shot, currentShot];
+        } else if (isAuto && state.lastSuccessShot && (Date.now() - state.lastSuccessShot.ts < 90000)) {
+          contextPassageShot = state.lastSuccessShot.shot;
         }
         const useDual = el.dualSendToggle && el.dualSendToggle.checked;
         const geminiParts = [{ text: promptText }];
+        if (contextPassageShot) {
+          geminiParts.push({ text: '[참고용 직전 화면 — 현재 화면에 지문이 없을 때만 참고, 이 화면의 문항은 중복 출력 금지]' });
+          geminiParts.push({ inline_data: { mime_type: 'image/jpeg', data: contextPassageShot.filteredB64 } });
+          geminiParts.push({ text: '[현재 풀어야 할 메인 화면]' });
+        }
         shotsToSend.forEach((sh) => {
           geminiParts.push({ inline_data: { mime_type: 'image/jpeg', data: sh.filteredB64 } });
           if (useDual && sh.rawB64) {
@@ -1119,12 +1241,12 @@
             await new Promise(r => setTimeout(r, 450));
             answerText = `14번: ③`;
           } else if (state.settings.provider === 'gemini') {
-            const callGemini = async () => {
+            const callGeminiWithKey = async (keyToUse, label) => {
               const controller = new AbortController();
               const timeoutId = setTimeout(() => controller.abort(), 25000);
               try {
-                setStatus('busy', `${state.settings.model} 요청 중...`);
-                const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(state.settings.model)}:generateContent?key=${encodeURIComponent(state.settings.apiKey)}`;
+                setStatus('busy', `${state.settings.model} (${label}) 요청 중...`);
+                const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(state.settings.model)}:generateContent?key=${encodeURIComponent(keyToUse)}`;
                 const res = await fetch(url, {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
@@ -1137,61 +1259,30 @@
                 const rawText = await res.text();
                 let json = {};
                 try { json = JSON.parse(rawText); } catch (e) {}
-                if (!res.ok) throw new Error(json.error?.message || `HTTP ${res.status}`);
+                if (!res.ok) {
+                  const err = new Error(json.error?.message || `HTTP ${res.status}`);
+                  err.httpStatus = res.status;
+                  throw err;
+                }
                 const txt = json.candidates?.[0]?.content?.parts?.map(p => p.text).join('\n') || '';
-                // HTTP 200 OK stays on Gemini even if unreadable/empty
                 return txt.trim() || '재촬영 필요';
               } finally {
                 clearTimeout(timeoutId);
               }
             };
 
-            const callGroqBackup = async () => {
-              const controller = new AbortController();
-              const timeoutId = setTimeout(() => controller.abort(), 30000);
-              try {
-                setStatus('busy', 'Groq (qwen3.8-27b) 백업 요청 중...');
-                const imgContents = [];
-                shotsToSend.forEach((sh) => {
-                  imgContents.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${sh.filteredB64}` } });
-                  if (useDual && sh.rawB64 && imgContents.length < 3) {
-                    imgContents.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${sh.rawB64}` } });
-                  }
-                });
-                const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-                  method: 'POST',
-                  headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${state.settings.groqApiKey}`
-                  },
-                  signal: controller.signal,
-                  body: JSON.stringify({
-                    model: 'qwen/qwen3.8-27b',
-                    messages: [{
-                      role: 'user',
-                      content: [{ type: 'text', text: promptText }, ...imgContents.slice(0, 3)]
-                    }],
-                    temperature: 0.1,
-                    max_tokens: 512,
-                    reasoning_effort: 'low'
-                  })
-                });
-                const rawText = await res.text();
-                let json = {};
-                try { json = JSON.parse(rawText); } catch (e) {}
-                if (!res.ok) throw new Error(json.error?.message || `Groq HTTP ${res.status}`);
-                return json.choices?.[0]?.message?.content || '재촬영 필요';
-              } finally {
-                clearTimeout(timeoutId);
-              }
-            };
-
             try {
-              answerText = await callGemini();
+              answerText = await callGeminiWithKey(state.settings.apiKey, '기본 키');
             } catch (geminiErr) {
-              if (state.settings.groqApiKey) {
-                showToast('Gemini 서버/연결 오류 — Groq 백업으로 자동 전환합니다.', 'info');
-                answerText = await callGroqBackup();
+              const st = geminiErr.httpStatus || 0;
+              const isServerOrQuotaError =
+                st === 429 ||
+                st >= 500 ||
+                geminiErr.name === 'AbortError' ||
+                geminiErr instanceof TypeError;
+              if (isServerOrQuotaError && state.settings.backupGeminiKey) {
+                showToast(`기본 Gemini 제한(HTTP ${st || '연결'}) — 백업 Gemini 키로 자동 전환합니다.`, 'info');
+                answerText = await callGeminiWithKey(state.settings.backupGeminiKey, '백업 키');
               } else {
                 throw geminiErr;
               }
@@ -1241,6 +1332,10 @@
             state.autoCarryShot = { shot: currentShot, ts: Date.now() };
           } else {
             state.autoCarryShot = null;
+        state.lastSuccessShot = null;
+            if (isAuto) {
+              state.lastSuccessShot = { shot: currentShot, ts: Date.now() };
+            }
           }
           addHistoryItem({
             id: Date.now(),
@@ -1289,7 +1384,7 @@
         state.currentResultText = text;
         el.resultTimestamp.textContent = timeStr;
 
-        const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+        const lines = text.replace(/\*\*/g, '').split('\n').map(l => l.trim()).filter(Boolean);
         el.resultContent.innerHTML = '';
 
         const header = document.createElement('div');
@@ -1350,22 +1445,24 @@
       function parseChoiceOrDigits(str) {
         const circled = { '①': '1', '②': '2', '③': '3', '④': '4', '⑤': '5', '⑥': '6', '⑦': '7', '⑧': '8', '⑨': '9' };
         const alpha = { 'A': '1', 'B': '2', 'C': '3', 'D': '4', 'E': '5' };
-        let normalized = str;
+        let normalized = str.replace(/[*_`\[\]().,번]/g, ' ');
         for (const [k, v] of Object.entries(circled)) {
           normalized = normalized.replaceAll(k, v);
         }
-        const firstToken = normalized.trim().split(/\s+/)[0] || '';
-        const upperFirst = firstToken.toUpperCase();
-        if (alpha[upperFirst]) return [parseInt(alpha[upperFirst], 10)];
+        const tokens = normalized.trim().split(/\s+/).filter(Boolean);
+        const firstToken = (tokens[0] || '').toUpperCase();
+        if (alpha[firstToken]) return [parseInt(alpha[firstToken], 10)];
         const digits = firstToken.match(/\d/g);
         if (digits && digits.length > 0) return digits.map(d => parseInt(d, 10));
+        const anyAlpha = normalized.toUpperCase().match(/\b([A-E])\b/);
+        if (anyAlpha && alpha[anyAlpha[1]]) return [parseInt(alpha[anyAlpha[1]], 10)];
         const anyDigits = normalized.match(/\d/g);
         if (anyDigits && anyDigits.length > 0) return [parseInt(anyDigits[0], 10)];
-        return [1];
+        return [];
       }
 
       function buildVibrationTimeline(text) {
-        const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+        const lines = text.replace(/\*\*/g, '').split('\n').map(l => l.trim()).filter(Boolean);
         const pattern = []; // [onMs, offMs, ...]
         const events = [];  // { offsetMs, durationMs, label, color }
         let cursor = 0;
@@ -1376,12 +1473,12 @@
           // Always a single unbroken pulse per unit (never split into sub-taps)
           let baseMs = onMs;
           if (stealth) {
-            if (onMs >= 400) baseMs = 140;      // Tens: single 140ms pulse
-            else if (onMs >= 250) baseMs = 100; // 5-anchor: single 100ms pulse
+            if (onMs >= 400) baseMs = 115;      // Tens: single 115ms pulse
+            else if (onMs >= 250) baseMs = 95;  // 5-anchor: single 95ms pulse
             else if (onMs >= 180) baseMs = 65;  // Answer choice: single 65ms pulse
-            else baseMs = 32;                   // Ones (+1~4): single 32ms tap
+            else baseMs = 70;                   // Ones (+1~4): bumped to 70ms for crisp skin detection
           }
-          const scaledOn = Math.max(20, Math.round(baseMs * strength));
+          const scaledOn = Math.max(28, Math.round(baseMs * strength));
           pattern.push(scaledOn, offMs);
           events.push({ offsetMs: cursor, durationMs: scaledOn, label, color });
           cursor += scaledOn + offMs;
@@ -1418,15 +1515,15 @@
               const hasFive = ones >= 5;
               const rem = ones % 5;
               if (hasFive) {
-                pushPulse(280, rem > 0 ? 340 : 2000, `문항 일의자리 (5 기준) · ${ones}`, 'bg-cyan-400 scale-125');
+                pushPulse(280, rem > 0 ? 620 : 2000, `문항 일의자리 (5 기준) · ${ones}`, 'bg-cyan-400 scale-125');
               }
               for (let c = 0; c < rem; c++) {
                 const isLast = c === rem - 1;
-                pushPulse(95, isLast ? 2000 : 260, `문항 일의자리 (+${c + 1}) · 총 ${ones}`, 'bg-cyan-400 scale-125');
+                pushPulse(95, isLast ? 2000 : 380, `문항 일의자리 (+${c + 1}) · 총 ${ones}`, 'bg-cyan-400 scale-125');
               }
             }
-          } else if (qPart) {
-            pushPulse(95, 2000, `문항 (${qPart})`, 'bg-cyan-400 scale-125');
+          } else {
+            // Question number not visible ('번호없음') -> skip question pulse so it isn't mistaken for #1
           }
 
           // 2) Answer choice (1~5): crisp 220ms pulse with 380ms gap
